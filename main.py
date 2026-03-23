@@ -1,9 +1,49 @@
 import sys
+import time
+from dataclasses import dataclass
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect
+from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QAction, QIcon, QGuiApplication
+
+@dataclass
+class PetState:
+    hunger: int = 0
+    energy: int = 100
+    boredom: int = 0
+    affection: int = 50
+    current_activity: str = 'idle'
+
+class StatDecayWorker(QThread):
+    """Background thread that manages the biological clock of the pet."""
+    state_updated = pyqtSignal(object)
+
+    def __init__(self, state: PetState):
+        super().__init__()
+        self.state = state
+        self.running = True
+
+    def run(self):
+        ticks_passed = 0
+        while self.running:
+            # Sleep in smaller chunks to allow faster thread termination
+            time.sleep(0.5)
+            ticks_passed += 0.5
+
+            if ticks_passed >= 5:
+                # Drain energy, increase hunger and boredom
+                self.state.energy = max(0, self.state.energy - 5)
+                self.state.hunger = min(100, self.state.hunger + 5)
+                self.state.boredom = min(100, self.state.boredom + 5)
+
+                # Emit the updated state back to the main GUI thread
+                self.state_updated.emit(self.state)
+                ticks_passed = 0
+
+    def stop(self):
+        self.running = False
+        self.wait()
 
 class SpriteAnimator:
     """Handles loading and animating a sprite sheet."""
@@ -64,11 +104,30 @@ class PetWindow(QWidget):
         self.drag_position = QPoint()
         self.total_screen_geometry = QRect()
 
+        self.state = PetState()
+
         self._setup_window()
         self._setup_multi_monitor()
         self._setup_ui()
         self._setup_tray()
         self._setup_animation(sprite_path)
+        self._setup_worker()
+
+    def _setup_worker(self):
+        self.worker = StatDecayWorker(self.state)
+        self.worker.state_updated.connect(self.update_pet_state)
+        self.worker.start()
+
+    def update_pet_state(self, state: PetState):
+        # Threshold Logic
+        if state.energy < 10 and state.current_activity != 'sleeping':
+            state.current_activity = 'sleeping'
+            print("State change: Energy is low! Switching to sleep sprite.", flush=True)
+        elif state.hunger > 80 and state.current_activity != 'hungry':
+            state.current_activity = 'hungry'
+            print("State change: Very hungry! Switching to hungry sprite.", flush=True)
+        else:
+            print(f"Tick - Energy: {state.energy}, Hunger: {state.hunger}, Boredom: {state.boredom}, Activity: {state.current_activity}", flush=True)
 
     def _setup_window(self):
         self.setWindowFlags(
@@ -107,7 +166,7 @@ class PetWindow(QWidget):
         self.tray_menu = QMenu(self)
 
         quit_action = QAction("Quit", self)
-        quit_action.triggered.connect(QApplication.instance().quit)
+        quit_action.triggered.connect(self.quit_app)
         self.tray_menu.addAction(quit_action)
 
         self.tray_icon.setContextMenu(self.tray_menu)
@@ -135,6 +194,11 @@ class PetWindow(QWidget):
         if event.buttons() == Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self.drag_position)
             event.accept()
+
+    def quit_app(self):
+        print("Stopping worker thread safely...")
+        self.worker.stop()
+        QApplication.instance().quit()
 
 def main():
     app = QApplication(sys.argv)
