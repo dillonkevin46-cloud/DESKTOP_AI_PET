@@ -1,11 +1,19 @@
 import sys
 import time
+import asyncio
+import aiohttp
 from dataclasses import dataclass
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout
+    QApplication, QWidget, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout,
+    QTextEdit, QLineEdit
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QAction, QIcon, QGuiApplication
+
+from database import init_db, ChatHistory, MemoryTraits
+
+# Initialize the global sessionmaker
+SessionLocal = init_db()
 
 @dataclass
 class PetState:
@@ -44,6 +52,150 @@ class StatDecayWorker(QThread):
     def stop(self):
         self.running = False
         self.wait()
+
+class AIBrainWorker(QThread):
+    """Background thread that handles LLM inferences using local Ollama."""
+    response_ready = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, user_message: str, pet_state: PetState, history_limit: int = 5):
+        super().__init__()
+        self.user_message = user_message
+        self.pet_state = pet_state
+        self.history_limit = history_limit
+        self.url = "http://localhost:11434/api/chat"
+
+    def run(self):
+        asyncio.run(self.process_message())
+
+    async def process_message(self):
+        messages = self._build_context()
+
+        # Append the new user message
+        messages.append({"role": "user", "content": self.user_message})
+
+        # Save user message to DB
+        self._save_to_db("user", self.user_message)
+
+        payload = {
+            "model": "llama3", # Change to whatever model you use
+            "messages": messages,
+            "stream": False
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.url, json=payload, timeout=30) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        llm_reply = data.get("message", {}).get("content", "")
+                        self._save_to_db("assistant", llm_reply)
+                        self.response_ready.emit(llm_reply)
+                    else:
+                        error_msg = f"HTTP {response.status}: Failed to reach Ollama."
+                        self.error_occurred.emit(error_msg)
+        except aiohttp.ClientError as e:
+            self.error_occurred.emit(f"Connection error to Ollama: {e}")
+        except asyncio.TimeoutError:
+            self.error_occurred.emit("Ollama API timed out.")
+        except Exception as e:
+            self.error_occurred.emit(f"Unexpected Brain error: {e}")
+
+    def _build_context(self):
+        # Base system prompt dynamically injected with current stats
+        system_content = (
+            f"You are a virtual desktop pet. Your current stats are: "
+            f"Energy {self.pet_state.energy}/100, Hunger {self.pet_state.hunger}/100, "
+            f"Boredom {self.pet_state.boredom}/100, Affection {self.pet_state.affection}/100. "
+            f"Act accordingly. Keep responses short and full of personality."
+        )
+
+        messages = [{"role": "system", "content": system_content}]
+
+        # Inject memory and history if DB is active
+        if SessionLocal:
+            with SessionLocal() as db:
+                # Fetch 3-5 traits
+                traits = db.query(MemoryTraits).limit(5).all()
+                if traits:
+                    traits_text = "\n".join(f"- [{t.entity_type}]: {t.trait_description}" for t in traits)
+                    messages.append({"role": "system", "content": f"Relevant traits:\n{traits_text}"})
+
+                # Fetch last N messages
+                history = db.query(ChatHistory).order_by(ChatHistory.timestamp.desc()).limit(self.history_limit).all()
+                # Reverse to chronological order
+                for entry in reversed(history):
+                    messages.append({"role": entry.role, "content": entry.content})
+
+        return messages
+
+    def _save_to_db(self, role: str, content: str):
+        if SessionLocal:
+            try:
+                with SessionLocal() as db:
+                    new_chat = ChatHistory(role=role, content=content)
+                    db.add(new_chat)
+                    db.commit()
+            except Exception as e:
+                print(f"Failed to save {role} message to DB: {e}")
+
+class ChatWidget(QWidget):
+    """Semi-transparent tool window for chatting with the pet."""
+    def __init__(self, pet_state: PetState, parent=None):
+        super().__init__(parent)
+        self.pet_state = pet_state
+        self.worker = None
+
+        self.setWindowTitle("Chat with Pet")
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self.layout = QVBoxLayout(self)
+
+        self.history_display = QTextEdit()
+        self.history_display.setReadOnly(True)
+        self.history_display.setStyleSheet("background-color: rgba(0, 0, 0, 150); color: white; border-radius: 5px; padding: 5px;")
+
+        self.input_field = QLineEdit()
+        self.input_field.setStyleSheet("background-color: rgba(255, 255, 255, 200); color: black; border-radius: 5px; padding: 5px;")
+        self.input_field.setPlaceholderText("Type a message...")
+        self.input_field.returnPressed.connect(self._send_message)
+
+        self.layout.addWidget(self.history_display)
+        self.layout.addWidget(self.input_field)
+
+        self.resize(300, 400)
+
+    def _send_message(self):
+        msg = self.input_field.text().strip()
+        if not msg:
+            return
+
+        self.input_field.clear()
+        self.history_display.append(f"<b>You:</b> {msg}")
+        self.input_field.setEnabled(False) # Disable input while processing
+
+        # Spawn AIBrainWorker
+        self.worker = AIBrainWorker(msg, self.pet_state)
+        self.worker.response_ready.connect(self._on_response)
+        self.worker.error_occurred.connect(self._on_error)
+        self.worker.start()
+
+    def _on_response(self, response: str):
+        self.history_display.append(f"<b>Pet:</b> {response}")
+        self._cleanup_worker()
+
+    def _on_error(self, error_msg: str):
+        self.history_display.append(f"<i><span style='color:red;'>System:</span> {error_msg}</i>")
+        self._cleanup_worker()
+
+    def _cleanup_worker(self):
+        self.input_field.setEnabled(True)
+        self.input_field.setFocus()
+        if self.worker:
+            self.worker.deleteLater()
+            self.worker = None
+
 
 class SpriteAnimator:
     """Handles loading and animating a sprite sheet."""
@@ -106,6 +258,8 @@ class PetWindow(QWidget):
 
         self.state = PetState()
 
+        self.chat_widget = ChatWidget(self.state)
+
         self._setup_window()
         self._setup_multi_monitor()
         self._setup_ui()
@@ -165,6 +319,10 @@ class PetWindow(QWidget):
 
         self.tray_menu = QMenu(self)
 
+        toggle_chat_action = QAction("Toggle Chat", self)
+        toggle_chat_action.triggered.connect(self.toggle_chat)
+        self.tray_menu.addAction(toggle_chat_action)
+
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.quit_app)
         self.tray_menu.addAction(quit_action)
@@ -190,10 +348,21 @@ class PetWindow(QWidget):
             self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
 
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_chat()
+            event.accept()
+
     def mouseMoveEvent(self, event):
         if event.buttons() == Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self.drag_position)
             event.accept()
+
+    def toggle_chat(self):
+        if self.chat_widget.isVisible():
+            self.chat_widget.hide()
+        else:
+            self.chat_widget.show()
 
     def quit_app(self):
         print("Stopping worker thread safely...")
